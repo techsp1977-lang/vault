@@ -978,6 +978,51 @@ async function unlockWithBiometrics(){
 }
 
 // ============================================================
+// SHARING LAYER — encrypt/decrypt tiles for transfer between vaults
+// ============================================================
+// Uses a shared password (agreed on out-of-band between the two people)
+// stored in each vault. Shared tiles are encrypted with a key derived from
+// this shared password, encoded as base64, and can be sent via any channel
+// (text, email, etc). The recipient's vault decrypts with the same shared
+// password and adds the entry.
+//
+// Format of share blob:
+//   VAULT1:<base64-encoded-json>
+// where the JSON contains { v, salt, iv, data } — same envelope as vault
+// encryption but keyed with the shared password.
+
+const SHARE_PREFIX = 'VAULT1:';
+
+async function encryptShareBlob(entryData, sharePassword){
+  const payload = await encryptData(JSON.stringify(entryData), sharePassword);
+  // Compact JSON, then base64 the whole thing so it's one clean token
+  const json = JSON.stringify(payload);
+  const bytes = new TextEncoder().encode(json);
+  return SHARE_PREFIX + bufToB64(bytes.buffer);
+}
+
+async function decryptShareBlob(blob, sharePassword){
+  const trimmed = blob.trim();
+  if(!trimmed.startsWith(SHARE_PREFIX)){
+    throw new Error('This does not look like a shared vault tile.');
+  }
+  const b64 = trimmed.slice(SHARE_PREFIX.length).replace(/\s+/g, '');
+  let payload;
+  try {
+    const jsonBytes = b64ToBuf(b64);
+    const json = new TextDecoder().decode(jsonBytes);
+    payload = JSON.parse(json);
+  } catch(e){
+    throw new Error('Share text is corrupted or incomplete.');
+  }
+  if(!payload.v || !payload.salt || !payload.iv || !payload.data){
+    throw new Error('Share format not recognized.');
+  }
+  const plain = await decryptData(payload, sharePassword);
+  return JSON.parse(plain);
+}
+
+// ============================================================
 // STATE
 // ============================================================
 let masterPassword = null;
@@ -1404,6 +1449,7 @@ function openDetail(id){
 
     <div class="detail-edit-row">
       <button class="btn-outline" id="btnEdit">Edit</button>
+      <button class="btn-outline" id="btnShare">Share</button>
       <button class="btn-danger" id="btnDelete">Delete</button>
     </div>
   `;
@@ -1440,6 +1486,7 @@ function openDetail(id){
     });
   }
   document.getElementById('btnEdit').addEventListener('click', () => openEditor(id));
+  document.getElementById('btnShare').addEventListener('click', () => shareEntry(id));
   document.getElementById('btnDelete').addEventListener('click', async () => {
     if(!confirm('Delete "' + entry.name + '"? This cannot be undone.')) return;
     vault.entries = vault.entries.filter(e => e.id !== id);
@@ -1714,6 +1761,20 @@ function openSettings(){
       </div>
       <div class="settings-row-arrow">→</div>
     </div>
+    <div class="settings-row" id="setSharePassword">
+      <div class="settings-row-text">
+        <div class="settings-row-title">${vault.sharePassword ? 'Change share password' : 'Set share password'}</div>
+        <div class="settings-row-desc">${vault.sharePassword ? 'Share password is set. Both people must use the same one.' : 'A shared password used to send/receive individual tiles with someone else.'}</div>
+      </div>
+      <div class="settings-row-arrow">→</div>
+    </div>
+    <div class="settings-row" id="setReceiveShared">
+      <div class="settings-row-text">
+        <div class="settings-row-title">Receive shared tile</div>
+        <div class="settings-row-desc">Paste a shared tile someone sent you.</div>
+      </div>
+      <div class="settings-row-arrow">→</div>
+    </div>
     <div class="settings-row" id="setExport">
       <div class="settings-row-text">
         <div class="settings-row-title">Export encrypted backup</div>
@@ -1766,6 +1827,8 @@ function openSettings(){
   `;
 
   document.getElementById('setBiometric').addEventListener('click', toggleBiometric);
+  document.getElementById('setSharePassword').addEventListener('click', setSharePassword);
+  document.getElementById('setReceiveShared').addEventListener('click', receiveSharedTile);
   document.getElementById('setExport').addEventListener('click', exportEncrypted);
   document.getElementById('setImport').addEventListener('click', importBackup);
   document.getElementById('setExportPlain').addEventListener('click', exportPlain);
@@ -1843,6 +1906,223 @@ function importBackup(){
     } catch(err){ toast('Could not read file','danger'); }
   };
   input.click();
+}
+
+// ============================================================
+// SHARING UI — send/receive tiles between vaults
+// ============================================================
+
+function setSharePassword(){
+  const currentlySet = !!vault.sharePassword;
+  const body = document.getElementById('sheetBody');
+  body.innerHTML = `
+    <div style="margin-bottom: 20px; font-size: 13px; color: var(--text-dim); line-height: 1.5;">
+      ${currentlySet ? 'Your share password is already set. Setting a new one will replace it — you and the other person must both use the same value.' : 'The share password is what encrypts tiles you send to (or receive from) another person. It is separate from your master password. Both people must set the same share password.'}
+      <br><br>
+      Pick something you can share verbally or through a trusted channel with the other person. Not too short.
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Share Password</label>
+      <div class="field-row two-actions">
+        <input type="password" id="fSharePw" placeholder="e.g. our-family-2026" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" />
+        <button type="button" class="field-action" id="fSharePwToggle" aria-label="Show">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Confirm</label>
+      <div class="field-row">
+        <input type="password" id="fSharePwConfirm" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" />
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn-primary" id="fShareSave">Save</button>
+      ${currentlySet ? '<button class="btn-danger" id="fShareClear">Remove</button>' : ''}
+    </div>
+  `;
+
+  document.getElementById('fSharePwToggle').addEventListener('click', () => {
+    const inp = document.getElementById('fSharePw');
+    inp.type = inp.type === 'password' ? 'text' : 'password';
+  });
+
+  document.getElementById('fShareSave').addEventListener('click', async () => {
+    const pw = document.getElementById('fSharePw').value;
+    const confirm = document.getElementById('fSharePwConfirm').value;
+    if(!pw){ toast('Share password required', 'danger'); return; }
+    if(pw.length < 6){ toast('Use at least 6 characters', 'danger'); return; }
+    if(pw !== confirm){ toast('Passwords do not match', 'danger'); return; }
+    vault.sharePassword = pw;
+    await saveVault();
+    openSettings();
+    toast('Share password saved');
+  });
+
+  const clearBtn = document.getElementById('fShareClear');
+  if(clearBtn){
+    clearBtn.addEventListener('click', async () => {
+      if(!window.confirm('Remove the share password? You won\'t be able to send or receive shared tiles until you set it again.')) return;
+      delete vault.sharePassword;
+      await saveVault();
+      openSettings();
+      toast('Share password removed');
+    });
+  }
+
+  openSheet('Share Password');
+  setTimeout(() => document.getElementById('fSharePw').focus(), 300);
+}
+
+async function shareEntry(id){
+  const entry = vault.entries.find(e => e.id === id);
+  if(!entry) return;
+
+  if(!vault.sharePassword){
+    // Prompt them to set it first
+    const body = document.getElementById('sheetBody');
+    body.innerHTML = `
+      <div style="margin-bottom: 20px; font-size: 14px; color: var(--text); line-height: 1.5;">
+        You haven't set a share password yet.
+      </div>
+      <div style="margin-bottom: 20px; font-size: 13px; color: var(--text-dim); line-height: 1.5;">
+        To share a tile, you first need to agree on a share password with the person you're sharing with. Both of you set the same one in your vaults, then you can send tiles back and forth.
+      </div>
+      <div class="form-actions">
+        <button class="btn-primary" id="fGoSetShare">Set Share Password</button>
+      </div>
+    `;
+    document.getElementById('fGoSetShare').addEventListener('click', setSharePassword);
+    openSheet('Share Tile');
+    return;
+  }
+
+  // Build the shareable payload (strip internal ids/timestamps/color — recipient makes their own)
+  const payload = {
+    name: entry.name,
+    username: entry.username || '',
+    password: entry.password || '',
+    url: entry.url || '',
+    category: entry.category || '',
+    notes: entry.notes || ''
+  };
+
+  let blob;
+  try {
+    blob = await encryptShareBlob(payload, vault.sharePassword);
+  } catch(err){
+    toast('Could not create share', 'danger');
+    return;
+  }
+
+  const body = document.getElementById('sheetBody');
+  body.innerHTML = `
+    <div style="margin-bottom: 16px; font-size: 13px; color: var(--text-dim); line-height: 1.5;">
+      Copy this text and send it to the other person (text, email, etc.). Only someone with the matching share password can read it.
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Sharing "${escapeHtml(entry.name)}"</label>
+      <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 11px; color: var(--text-dim); word-break: break-all; max-height: 180px; overflow-y: auto; user-select: all; -webkit-user-select: all;">${escapeHtml(blob)}</div>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn-primary" id="fCopyShare">Copy to Clipboard</button>
+    </div>
+
+    <div style="margin-top: 20px; padding: 12px; background: var(--bg-card); border-radius: 8px; font-size: 12px; color: var(--text-faint); line-height: 1.5;">
+      💡 The other person should open their vault → Settings → Receive shared tile → paste this text.
+    </div>
+  `;
+
+  document.getElementById('fCopyShare').addEventListener('click', () => {
+    copyToClipboard(blob, 'Share text');
+  });
+
+  openSheet('Share Tile');
+}
+
+function receiveSharedTile(){
+  if(!vault.sharePassword){
+    const body = document.getElementById('sheetBody');
+    body.innerHTML = `
+      <div style="margin-bottom: 20px; font-size: 14px; color: var(--text); line-height: 1.5;">
+        You haven't set a share password yet.
+      </div>
+      <div style="margin-bottom: 20px; font-size: 13px; color: var(--text-dim); line-height: 1.5;">
+        To receive a shared tile, you need the same share password as the person who sent it.
+      </div>
+      <div class="form-actions">
+        <button class="btn-primary" id="fGoSetShare">Set Share Password</button>
+      </div>
+    `;
+    document.getElementById('fGoSetShare').addEventListener('click', setSharePassword);
+    openSheet('Receive Shared Tile');
+    return;
+  }
+
+  const allCats = vault.categories.slice();
+  const body = document.getElementById('sheetBody');
+  body.innerHTML = `
+    <div style="margin-bottom: 20px; font-size: 13px; color: var(--text-dim); line-height: 1.5;">
+      Paste the share text below. It should start with <code style="background: var(--bg-card); padding: 2px 5px; border-radius: 3px;">VAULT1:</code>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Share Text</label>
+      <textarea id="fReceiveBlob" placeholder="VAULT1:..." autocapitalize="off" autocorrect="off" spellcheck="false" style="min-height: 120px; font-size: 11px; word-break: break-all;"></textarea>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Save to Category</label>
+      <div class="field-row">
+        <select id="fReceiveCat">
+          ${allCats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn-primary" id="fReceiveGo">Import Tile</button>
+    </div>
+  `;
+
+  document.getElementById('fReceiveGo').addEventListener('click', async () => {
+    const blob = document.getElementById('fReceiveBlob').value.trim();
+    const cat = document.getElementById('fReceiveCat').value;
+    if(!blob){ toast('Paste the share text first', 'danger'); return; }
+    try {
+      const payload = await decryptShareBlob(blob, vault.sharePassword);
+      // Create a new entry with a fresh id/timestamp; use recipient's category if entry didn't have one
+      const newEntry = {
+        id: uid(),
+        name: payload.name || 'Untitled',
+        username: payload.username || '',
+        password: payload.password || '',
+        url: payload.url || '',
+        category: cat || payload.category || (vault.categories[0] || 'Other'),
+        notes: payload.notes || '',
+        color: '',
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+      vault.entries.push(newEntry);
+      await saveVault();
+      renderChips();
+      renderGrid();
+      closeSheet();
+      toast('Tile imported');
+    } catch(err){
+      const msg = err && err.message ? err.message : 'Could not import';
+      toast(msg, 'danger');
+    }
+  });
+
+  openSheet('Receive Shared Tile');
+  setTimeout(() => document.getElementById('fReceiveBlob').focus(), 300);
 }
 
 async function toggleBiometric(){
