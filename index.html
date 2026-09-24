@@ -1002,24 +1002,43 @@ async function encryptShareBlob(entryData, sharePassword){
 }
 
 async function decryptShareBlob(blob, sharePassword){
-  const trimmed = blob.trim();
-  if(!trimmed.startsWith(SHARE_PREFIX)){
-    throw new Error('This does not look like a shared vault tile.');
+  // Be forgiving about what pasted text looks like — iOS/Messages can add
+  // link previews, whitespace, or autocapitalize the prefix.
+  let cleaned = String(blob || '').trim();
+
+  // Find the prefix anywhere in the text (case-insensitive), then take from there
+  const prefixIdx = cleaned.toUpperCase().indexOf('VAULT1:');
+  if(prefixIdx < 0){
+    throw new Error('No share code found in the pasted text.');
   }
-  const b64 = trimmed.slice(SHARE_PREFIX.length).replace(/\s+/g, '');
+  cleaned = cleaned.slice(prefixIdx + 'VAULT1:'.length);
+
+  // Strip whitespace, line breaks, and anything that isn't a valid base64 char.
+  // Also handle URL-safe base64 variants.
+  const validB64 = cleaned.match(/^[A-Za-z0-9+/=_-]+/);
+  const b64 = validB64 ? validB64[0].replace(/-/g, '+').replace(/_/g, '/') : '';
+
+  if(!b64){
+    throw new Error('Share code is empty or malformed.');
+  }
+
   let payload;
   try {
     const jsonBytes = b64ToBuf(b64);
     const json = new TextDecoder().decode(jsonBytes);
     payload = JSON.parse(json);
   } catch(e){
-    throw new Error('Share text is corrupted or incomplete.');
+    throw new Error('Share text is corrupted or was cut short. Ask them to resend.');
   }
   if(!payload.v || !payload.salt || !payload.iv || !payload.data){
     throw new Error('Share format not recognized.');
   }
-  const plain = await decryptData(payload, sharePassword);
-  return JSON.parse(plain);
+  try {
+    const plain = await decryptData(payload, sharePassword);
+    return JSON.parse(plain);
+  } catch(e){
+    throw new Error('Wrong share password, or text was altered in transit.');
+  }
 }
 
 // ============================================================
